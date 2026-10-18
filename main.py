@@ -1,9 +1,11 @@
 import streamlit as st
 import requests
+import io
+from pypdf import PdfReader
 
 st.set_page_config(page_title="AI Agent + Document", layout="wide")
 
-# ====== МОДЕЛИ ИЗ ТВОЕГО app.py ======
+# ====== МОДЕЛИ ======
 AVAILABLE_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -19,7 +21,11 @@ MODEL_DISPLAY_NAMES = {
     "openai/gpt-oss-safeguard-20b": "GPT-OSS Safeguard",
 }
 
-# ====== GROQ (адаптировано из app.py) ======
+# Сколько символов документа подмешивать в system-prompt
+DOC_CONTEXT_LIMIT = 6000
+
+
+# ====== GROQ ======
 def chat_with_groq(api_key, model, messages, system_prompt="", temperature=0.7):
     payload = []
     if system_prompt:
@@ -38,6 +44,21 @@ def chat_with_groq(api_key, model, messages, system_prompt="", temperature=0.7):
     return r.json()["choices"][0]["message"]["content"]
 
 
+# ====== PDF ======
+def extract_pdf_text(file_bytes: bytes) -> tuple[str, int]:
+    """Возвращает (текст, кол-во страниц)."""
+    reader = PdfReader(io.BytesIO(file_bytes))
+    pages = []
+    for i, page in enumerate(reader.pages, start=1):
+        try:
+            txt = page.extract_text() or ""
+        except Exception as e:
+            txt = f"[Ошибка извлечения стр. {i}: {e}]"
+        if txt.strip():
+            pages.append(f"--- стр. {i} ---\n{txt}")
+    return "\n\n".join(pages), len(reader.pages)
+
+
 # ====== SESSION STATE ======
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -45,6 +66,8 @@ if "doc_text" not in st.session_state:
     st.session_state.doc_text = ""
 if "doc_name" not in st.session_state:
     st.session_state.doc_name = "—"
+if "doc_pages" not in st.session_state:
+    st.session_state.doc_pages = 0
 
 # ====== САЙДБАР ======
 with st.sidebar:
@@ -73,6 +96,11 @@ with st.sidebar:
         height=120,
     )
 
+    st.divider()
+    st.caption(f"📄 Документ: **{st.session_state.doc_name}**")
+    st.caption(f"Страниц: {st.session_state.doc_pages} · "
+               f"символов: {len(st.session_state.doc_text):,}")
+
     if st.button("🗑 Очистить чат", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -82,9 +110,10 @@ if not api_key:
                "[Получить бесплатно](https://console.groq.com)")
     st.stop()
 
-# ====== МАКЕТ: слева чат, справа документ ======
+# ====== МАКЕТ ======
 left, right = st.columns([1, 1.4], gap="large")
 
+# ---------- ЧАТ ----------
 with left:
     st.subheader("💬 Чат с ИИ-агентом")
 
@@ -101,11 +130,10 @@ with left:
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-        # Подмешиваем документ в system-промпт (RAG-lite)
         ctx = ""
         if st.session_state.doc_text:
-            ctx = f"\n\n=== ДОКУМЕНТ ({st.session_state.doc_name}) ===\n" \
-                  f"{st.session_state.doc_text[:6000]}"
+            ctx = (f"\n\n=== ДОКУМЕНТ ({st.session_state.doc_name}) ===\n"
+                   f"{st.session_state.doc_text[:DOC_CONTEXT_LIMIT]}")
 
         with chat_box:
             with st.chat_message("assistant"):
@@ -120,25 +148,43 @@ with left:
                         reply = f"❌ Ошибка: {e}"
                 st.markdown(reply)
 
-        st.session_state.messages.append({"role": "assistant", "content": reply})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": reply})
         st.rerun()
 
+# ---------- ДОКУМЕНТ ----------
 with right:
     st.subheader("📄 Документ")
 
     uploaded = st.file_uploader(
         "Открыть файл",
-        type=["txt", "md", "py", "json", "csv", "log"],
+        type=["txt", "md", "py", "json", "csv", "log", "pdf"],
     )
+
     if uploaded is not None:
         try:
-            st.session_state.doc_text = uploaded.read().decode(
-                "utf-8", errors="replace")
-            st.session_state.doc_name = uploaded.name
+            if uploaded.name.lower().endswith(".pdf"):
+                text, pages = extract_pdf_text(uploaded.read())
+                st.session_state.doc_text = text
+                st.session_state.doc_name = uploaded.name
+                st.session_state.doc_pages = pages
+                if not text.strip():
+                    st.warning("⚠️ В PDF нет извлекаемого текста "
+                               "(возможно, это сканы — нужен OCR).")
+            else:
+                st.session_state.doc_text = uploaded.read().decode(
+                    "utf-8", errors="replace")
+                st.session_state.doc_name = uploaded.name
+                st.session_state.doc_pages = 0
         except Exception as e:
             st.error(f"Ошибка чтения: {e}")
 
-    st.caption(f"Файл: {st.session_state.doc_name}")
+    st.caption(
+        f"Файл: **{st.session_state.doc_name}** · "
+        f"{len(st.session_state.doc_text):,} символов"
+        + (f" · {st.session_state.doc_pages} стр."
+           if st.session_state.doc_pages else "")
+    )
 
     edit_mode = st.toggle("Редактировать", value=False)
     if edit_mode:
